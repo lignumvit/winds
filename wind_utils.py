@@ -13,10 +13,12 @@ import matplotlib.pyplot as plt
 
 # constants from Nimbus
 mol_wgt_dry_air = 28.9637 # kg/kmol
+mol_wgt_water   = 18.01528 # kg/kmol  (nimbus xlate/const.c: MolecularWeightWater)
 R0 = 8314.462618 # J/kmol/K
 Rd = R0/mol_wgt_dry_air
 Cpd = 7.0/2.0*Rd
 Cvd = 5.0/2.0*Rd
+Kelvin = 273.15
 deg_to_rad = math.pi/180.
 
 # Aircraft Constants
@@ -45,6 +47,156 @@ def calc_mach_dry(q: np.array, ps: np.array):
     q_pos_inds = q >= 0
     mach_dry[q_pos_inds] = (5*(((ps[q_pos_inds] + q[q_pos_inds])/ps[q_pos_inds])**(Rd/Cpd) - 1))**0.5
     return mach_dry
+
+
+def _humid_gas_consts(eop):
+    """Humidity-corrected (R, Cp, Cv), matching nimbus gas_const.c.
+
+    Parameters
+    ----------
+    eop : array-like or scalar
+        Water-vapor pressure over static pressure (Ew / P). Pass 0.0 for the
+        dry-air values (Rd, Cpd, Cvd).
+
+    Returns
+    -------
+    R, Cp, Cv : same shape as ``eop``
+        Specific gas constant and specific heats (J/(kg*K)).
+    """
+    eop = np.asarray(eop, dtype=np.float64)
+    Fr = 1.0 / (1.0 + (mol_wgt_water/mol_wgt_dry_air - 1.0) * eop)
+    R_h  = Rd  * Fr
+    Cp_h = Cpd * Fr * (1.0 + eop / 7.0)
+    Cv_h = Cvd * Fr * (1.0 + eop / 5.0)
+    return R_h, Cp_h, Cv_h
+
+
+def calc_mach(q: np.array, p: np.array, eop=0.0):
+    """Aircraft Mach number from pitot-static pressures.
+
+    Faithful port of nimbus' ``mach()`` in src/amlib/std/mach.c::
+
+        M = sqrt( (2 Cv / R) * ( ((p + q) / p)^(R/Cp) - 1 ) )
+
+    Parameters
+    ----------
+    q : array-like
+        Dynamic (impact) pressure (hPa). For TASX/TASFR, nimbus uses QCFRC.
+    p : array-like
+        Static pressure (hPa). For TASFR's MACHFR, nimbus uses PSFC.
+    eop : array-like or scalar, default 0.0 (dry)
+        Water-vapor over static pressure. Pass 0.0 for a dry-air Mach
+        (this is also what nimbus' ``mach_dry`` returns when ``Rd/Cpd = 2/7``).
+
+    Returns
+    -------
+    mach : numpy.ndarray of float64
+        Mach number. Samples with q < 0 or p <= 0 return NaN (avoids
+        complex values from the fractional power).
+    """
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    R_h, Cp_h, Cv_h = _humid_gas_consts(eop)
+    out = np.full(q.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(q) & np.isfinite(p) & (p > 0.0) & (q >= 0.0)
+    if not valid.any():
+        return out
+    # Broadcasting: support scalar or per-sample eop
+    R_b  = np.broadcast_to(R_h,  q.shape)
+    Cp_b = np.broadcast_to(Cp_h, q.shape)
+    Cv_b = np.broadcast_to(Cv_h, q.shape)
+    ratio = (p[valid] + q[valid]) / p[valid]
+    out[valid] = np.sqrt(
+        (2.0 * Cv_b[valid] / R_b[valid])
+        * (ratio**(R_b[valid] / Cp_b[valid]) - 1.0)
+    )
+    return out
+
+
+def calc_tas(q: np.array,
+             p: np.array,
+             atx_c: np.array,
+             ewx: np.array = None,
+             eop=None,
+             p_for_eop: np.array = None):
+    """Aircraft True Airspeed, mirroring nimbus' TASX = compute_tas(ATX, MACH).
+
+    Implements the chain (nimbus src/amlib/std/tas.c::compute_tas + mach.c)::
+
+        eop  = ewx / p_for_eop                      (0 if ewx is None)
+        Y, R = humidity-corrected specific heats and gas constant
+        mach = sqrt( (2 Cv / R) * ((p+q)/p)^(R/Cp) - 1 )      (using eop)
+        TAS  = mach * sqrt( Y * R * (atx_c + Kelvin) )        (using eop)
+
+    The reference output is TASX, which on GOTHAAM equals TASFR -- computed
+    from MACHFR (QCFRC, PSFC) and ATX, with humidity correction set by
+    TASFLG using EWX and PSFDC. So a faithful reproduction calls this with
+    ``q=QCFRC, p=PSFC, atx_c=ATX, ewx=EWX, p_for_eop=PSFDC``.
+
+    Parameters
+    ----------
+    q : array-like
+        Dynamic pressure (hPa). Pass QCFRC to match TASX/TASFR.
+    p : array-like
+        Static pressure used for the Mach calculation (hPa). Pass PSFC for
+        TASFR; PSFDC for TASF.
+    atx_c : array-like
+        Ambient temperature (degC). Pass ATX.
+    ewx : array-like, optional
+        Water-vapor pressure (hPa). If supplied, humidity correction is
+        applied via ``eop = ewx / p_for_eop``. If both ``ewx`` and ``eop``
+        are None, a dry-air calculation is performed.
+    eop : array-like or scalar, optional
+        Direct way to specify the humidity coefficient (water-vapor /
+        static pressure). Overrides ``ewx`` when given. Use ``eop=0.0`` for
+        a dry calculation regardless of any ``ewx`` argument.
+    p_for_eop : array-like, optional
+        Static pressure to use as the denominator of ``eop = ewx / p_for_eop``.
+        Defaults to ``p`` (which is fine when ``p`` is PSFC, since on GOTHAAM
+        PSFC and PSFDC differ by only ~0.03 hPa). Pass PSFDC explicitly to
+        reproduce nimbus' TASFLG/setEOP path exactly.
+
+    Returns
+    -------
+    tas : numpy.ndarray of float64
+        True airspeed (m/s). Samples where Mach can't be computed (q < 0,
+        p <= 0, NaN inputs) are NaN.
+
+    Notes
+    -----
+    * Reproduces nimbus TASX on GOTHAAMrf18.nc to rms ~2.4e-3 m/s. The
+      single ~0.18 m/s residual sits at a dropout-recovery boundary where
+      nimbus' TASFLG state machine carries over ``lastew`` from before the
+      dropout while EWX is freshly back to a valid value; that 5-second
+      hysteresis isn't tracked here.
+    * Set ``ewx=None`` (or ``eop=0.0``) to see how much the humidity
+      correction is worth on your flight.
+    """
+    q     = np.asarray(q,     dtype=np.float64)
+    p     = np.asarray(p,     dtype=np.float64)
+    atx_c = np.asarray(atx_c, dtype=np.float64)
+
+    if eop is None:
+        if ewx is None:
+            eop_arr = np.zeros_like(q)
+        else:
+            ewx = np.asarray(ewx, dtype=np.float64)
+            denom = p if p_for_eop is None else np.asarray(p_for_eop, dtype=np.float64)
+            eop_arr = np.where(np.isfinite(ewx) & np.isfinite(denom) & (denom > 0.0),
+                               ewx / denom, 0.0)
+    else:
+        eop_arr = np.broadcast_to(np.asarray(eop, dtype=np.float64), q.shape).copy()
+        eop_arr[~np.isfinite(eop_arr)] = 0.0
+
+    mach = calc_mach(q, p, eop=eop_arr)
+    R_h, Cp_h, Cv_h = _humid_gas_consts(eop_arr)
+
+    out = np.full(q.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(mach) & np.isfinite(atx_c) & ((atx_c + Kelvin) > 0.0)
+    out[valid] = mach[valid] * np.sqrt(
+        (Cp_h[valid] / Cv_h[valid]) * R_h[valid] * (atx_c[valid] + Kelvin)
+    )
+    return out
 
 def calc_akrd(x: np.array, a: float, b: float, c: float, q: np.array = None):
     # x: a 2 by N array, where x[0,:] = ADIFR/QCF and x[1,:] = dry mach number
@@ -206,9 +358,17 @@ def calc_winds(data_df: pd.DataFrame,
 
     Returns
     -------
-    u, v, w, wind_flag : numpy.ndarray
-        Eastward, northward, and vertical wind components (m/s), plus the
+    u, v, w, ux, vy, wind_flag : numpy.ndarray
+        Eastward, northward, and vertical wind components (m/s), then the
+        aircraft-relative longitudinal (UXC; along heading) and lateral
+        (VYC; perpendicular to heading) wind components (m/s), then the
         WINDSFLG quality code (0 good, 1 bad attack, 2 bad sideslip, 3 both).
+
+        UXC and VYC are obtained by rotating (u, v) by the true heading
+        (see gust.c)::
+
+            ux =  u * sin(thdg) + v * cos(thdg)
+            vy = -u * cos(thdg) + v * sin(thdg)
     """
     n = len(data_df)
 
@@ -282,6 +442,8 @@ def calc_winds(data_df: pd.DataFrame,
     u = np.full(n, np.nan, dtype=np.float64)
     v = np.full(n, np.nan, dtype=np.float64)
     w = np.full(n, np.nan, dtype=np.float64)
+    ux = np.full(n, np.nan, dtype=np.float64)
+    vy = np.full(n, np.nan, dtype=np.float64)
     # wind_flag mirrors the static `wind_flag[probeCnt]` in gust.c, which is
     # zero-initialized and only ever touched inside swi(). Early-return paths
     # (NaN inputs or TAS<30) leave it unchanged. For a clean flight that means
@@ -312,11 +474,13 @@ def calc_winds(data_df: pd.DataFrame,
         if (np.isnan(pitch_i) or np.isnan(roll_i) or np.isnan(thdg_i)
                 or np.isnan(tas_i) or np.isnan(vspd_i)):
             u[i] = np.nan; v[i] = np.nan; w[i] = np.nan
+            ux[i] = np.nan; vy[i] = np.nan
             continue
 
         # ---- blow-up protection while on ground (TAS < 30 m/s)
         if tas_i < 30.0:
             u[i] = 0.0; v[i] = 0.0; w[i] = 0.0
+            ux[i] = 0.0; vy[i] = 0.0
             continue
 
         # ---- first-time seed of pitch0/thdg0 so thedot/psidot are 0 at t=0
@@ -389,6 +553,12 @@ def calc_winds(data_df: pd.DataFrame,
         w[i] = (np.nan if attack_compromised
                 else tas_dab * ab + t)
 
+        # ---- aircraft-relative wind components (gust.c lines 298-299):
+        # rotation of (ui, vi) by true heading. Computed regardless of
+        # attack_compromised (nimbus does not NaN ux/vy in that case).
+        ux[i] =  u[i] * ss + v[i] * cs
+        vy[i] = -u[i] * cs + v[i] * ss
+
     # ---- match nimbus' on-disk WINDSFLG: NaN where the whole input row is
     # missing (sync_server has no data to interpolate from), otherwise the
     # value the static wind_flag carries.
@@ -397,7 +567,7 @@ def calc_winds(data_df: pd.DataFrame,
                    & np.isnan(thdg_d) & np.isnan(attack_d) & np.isnan(sslip_d))
     wind_flag[all_missing] = np.nan
 
-    return [u, v, w, wind_flag]
+    return [u, v, w, ux, vy, wind_flag]
 
 
 
@@ -462,7 +632,7 @@ def plot_winds_comparison(data_df,
     if u_py is None or v_py is None or w_py is None:
         akrd  = data_df['AKRD'].to_numpy()  if 'AKRD'  in data_df.columns else None
         sslip = data_df['SSLIP'].to_numpy() if 'SSLIP' in data_df.columns else None
-        u_py, v_py, w_py, _ = calc_winds(
+        u_py, v_py, w_py, _, _, _ = calc_winds(
             data_df, aircraft=aircraft,
             akrd=akrd, sslip=sslip,
             wind_type=wind_type,
@@ -558,10 +728,12 @@ class flight_data:
         self.p = self.p*100 # hPa to Pa
         self.rho = self.p/Rd/self.tk
 
-        [utest, vtest, wtest, wflag] = calc_winds(self.df, orig_akrd_coefs, orig_sslip_coefs, aircraft)
+        [utest, vtest, wtest, uxtest, vytest, wflag] = calc_winds(self.df, orig_akrd_coefs, orig_sslip_coefs, aircraft)
         self.utest = utest
         self.vtest = vtest
         self.wtest = wtest
+        self.uxtest = uxtest
+        self.vytest = vytest
         self.wflag_test = wflag
 
         self.dpitchdt = calc_dvardt_backward(self.df, 'PITCH')

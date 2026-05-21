@@ -37,7 +37,7 @@ NEEDED = [
     "TASX", "VEWC", "VNSC", "GGVSPD",
     "PITCH", "ROLL", "THDG",
     "AKRD", "SSLIP",
-    "UIC", "VIC", "WIC", "WINDSFLG",
+    "UIC", "VIC", "WIC", "UXC", "VYC", "WINDSFLG",
     "ADIFR", "BDIFR", "QCF", "PSFD",
 ]
 
@@ -101,7 +101,7 @@ def main():
 
     # -- Validation #1: file's AKRD/SSLIP passed in directly
     print("Validation #1: akrd= and sslip= passed directly")
-    u1, v1, w1, wf1 = wind_utils.calc_winds(
+    u1, v1, w1, ux1, vy1, wf1 = wind_utils.calc_winds(
         df, aircraft="C130",
         akrd=df["AKRD"].to_numpy(), sslip=df["SSLIP"].to_numpy(),
         tas_var="TASX", vew_var="VEWC", vns_var="VNSC", vspd_var="GGVSPD",
@@ -111,13 +111,15 @@ def main():
     report("UIC",      df["UIC"].to_numpy(),      u1)
     report("VIC",      df["VIC"].to_numpy(),      v1)
     report("WIC",      df["WIC"].to_numpy(),      w1)
+    report("UXC",      df["UXC"].to_numpy(),      ux1)
+    report("VYC",      df["VYC"].to_numpy(),      vy1)
     report("WINDSFLG", df["WINDSFLG"].to_numpy(), wf1)
     print()
 
     # -- Validation #2: recompute AKRD/SSLIP from coefs, with mach-threshold switch
     print(f"Validation #2: aoa_coefs + aoa_coefs_alt + aos_coefs "
           f"(mach_threshold={args.mach_threshold})")
-    u2, v2, w2, wf2 = wind_utils.calc_winds(
+    u2, v2, w2, ux2, vy2, wf2 = wind_utils.calc_winds(
         df, aircraft="C130",
         aoa_coefs=aoa_coefs, aoa_coefs_alt=aoa_coefs_alt,
         mach_threshold=args.mach_threshold,
@@ -134,6 +136,8 @@ def main():
     report("UIC",      df["UIC"].to_numpy(),      u2)
     report("VIC",      df["VIC"].to_numpy(),      v2)
     report("WIC",      df["WIC"].to_numpy(),      w2)
+    report("UXC",      df["UXC"].to_numpy(),      ux2)
+    report("VYC",      df["VYC"].to_numpy(),      vy2)
     report("WINDSFLG", df["WINDSFLG"].to_numpy(), wf2)
 
     # how many samples landed in each coefficient set
@@ -145,13 +149,16 @@ def main():
           f"{n_clean} used clean.")
     print()
 
-    # -- Plot: 3 components x (tall overlay + short residual), plus a coef-set
+    # -- Plot: 5 components x (tall overlay + short residual), plus a coef-set
     # strip at the bottom showing where the dirty coef set was active.
     t = df["Time"].to_numpy()
-    py_components  = [("UIC", u2), ("VIC", v2), ("WIC", w2)]
-    fig = plt.figure(figsize=(12, 11))
+    py_components  = [("UIC", u2), ("VIC", v2), ("WIC", w2),
+                      ("UXC", ux2), ("VYC", vy2)]
+    fig = plt.figure(figsize=(12, 17))
     gs = fig.add_gridspec(
-        7, 1, height_ratios=[3, 1, 3, 1, 3, 1, 0.8], hspace=0.18,
+        11, 1,
+        height_ratios=[3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 0.8],
+        hspace=0.18,
     )
     shared_x = None
     for k, (name, py) in enumerate(py_components):
